@@ -1,0 +1,785 @@
+# =============================================================================
+# Btc scRNASeq - Seurat Analysis Pipeline
+# =============================================================================
+# Workflow:
+#   1. Package installation & loading
+#   2. Data loading & Seurat object creation
+#   3. Demultiplexing & metadata assignment
+#   4. QC filtering (mitochondrial content, Y-chromosome removal)
+#   5. DecontX ambient RNA removal
+#   6. Blood contamination removal
+#   7. Normalisation, variable features, scaling, PCA
+#   8. Batch correction (Harmony) & UMAP clustering
+#   9. Cluster annotation
+#  10. Differential expression (per-cluster FindMarkers + pseudobulk DESeq2)
+#  11. Pathway enrichment (GO, KEGG, Hallmark)
+# =============================================================================
+
+
+# =============================================================================
+# 1. PACKAGE INSTALLATION & LOADING
+# =============================================================================
+
+# CRAN packages
+cran_packages <- c(
+  "Seurat", "dplyr", "ggplot2", "patchwork", "tidyverse",
+  "clustree", "RColorBrewer", "remotes", "R.utils", "harmony",
+  "devtools", "reshape2", "ggrepel", "plyr"
+)
+install.packages(setdiff(cran_packages, rownames(installed.packages())), update = FALSE)
+
+# Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+bioc_packages <- c(
+  "SingleR", "celldex", "celda", "decontX",
+  "BiocGenerics", "DelayedArray", "DelayedMatrixStats",
+  "limma", "S4Vectors", "SingleCellExperiment",
+  "SummarizedExperiment", "edgeR", "fgsea", "DESeq2",
+  "clusterProfiler", "msigdbr", "org.Mm.eg.db"
+)
+BiocManager::install(setdiff(bioc_packages, rownames(installed.packages())), update = FALSE)
+
+# GitHub packages
+if (!requireNamespace("presto", quietly = TRUE))
+  devtools::install_github("immunogenomics/presto")
+if (!requireNamespace("Originator", quietly = TRUE))
+  devtools::install_github("lanagarmire/Originator/Originator/")
+
+# Load libraries
+library(Seurat)
+library(celda)          # contains decontX
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tidyverse)
+library(clustree)
+library(fgsea)
+library(reshape2)
+library(ggrepel)
+library(harmony)
+library(edgeR)
+library(limma)
+library(DESeq2)
+library(clusterProfiler)
+library(msigdbr)
+library(org.Mm.eg.db)
+
+
+# =============================================================================
+# 2. DATA LOADING & SEURAT OBJECT CREATION
+# =============================================================================
+
+setwd("#<OUTPUT DIRECTORY PATH>")
+
+data <- Read10X(data.dir = "#<CELL RANGER DATA DIRECTORY PATH>/Data_Aggr/count/filtered_feature_bc_matrix/")
+
+# Create Seurat object from Gene Expression matrix
+seurat_object <- CreateSeuratObject(
+  counts      = data[["Gene Expression"]],
+  min.cells   = 3,
+  min.features = 200,
+  project     = "Btc"
+)
+
+# Attach multiplexing capture assay
+seurat_object[["CMO"]] <- CreateAssayObject(
+  counts = data[["Multiplexing Capture"]][, colnames(seurat_object)]
+)
+
+
+# =============================================================================
+# 3. DEMULTIPLEXING & METADATA ASSIGNMENT
+# =============================================================================
+
+# Sample manifest: CMO tag -> sample ID, sex, condition
+sample_info <- list(
+  list(file      = "#<CELL RANGER DATA DIRECTORY PATH>/1593--_CMO_303_304/multi/multiplexing_analysis/tag_calls_per_cell.csv",
+       mapping   = c("CMO303" = "KO1593_03", "CMO304" = "KO1593_04"),
+       sex       = c("M", "M"),
+       condition = "Mut"),
+  list(file      = "#<CELL RANGER DATA DIRECTORY PATH>/1649--_CMO_301_302/multi/multiplexing_analysis/tag_calls_per_cell.csv",
+       mapping   = c("CMO301" = "KO1649_01", "CMO302" = "KO1649_02"),
+       sex       = c("M", "M"),
+       condition = "Mut"),
+  list(file      = "#<CELL RANGER DATA DIRECTORY PATH>/1593--_CMO_305_306/multi/multiplexing_analysis/tag_calls_per_cell.csv",
+       mapping   = c("CMO305" = "KO1593_05", "CMO306" = "KO1593_06"),
+       sex       = c("M", "M"),
+       condition = "Mut"),
+  list(file      = "#<CELL RANGER DATA DIRECTORY PATH>/1579++_CMO_309_310/multi/multiplexing_analysis/tag_calls_per_cell.csv",
+       mapping   = c("CMO309" = "WT1579_09", "CMO310" = "WT1579_10"),
+       sex       = c("M", "F"),
+       condition = "WT"),
+  list(file      = "#<CELL RANGER DATA DIRECTORY PATH>/1579++_CMO_311_312/multi/multiplexing_analysis/tag_calls_per_cell.csv",
+       mapping   = c("CMO311" = "WT1579_11", "CMO312" = "WT1579_12"),
+       sex       = c("F", "F"),
+       condition = "WT")
+)
+
+# Read each CSV, assign sample ID / sex / condition, remove doublets
+all_samples <- lapply(sample_info, function(info) {
+  df <- read.csv(info$file)
+
+  for (cmo in names(info$mapping)) {
+    df$sample[df$feature_call == cmo] <- info$mapping[[cmo]]
+  }
+  for (i in seq_along(info$mapping)) {
+    df$Sex[df$sample == info$mapping[[i]]] <- info$sex[i]
+  }
+
+  df$Condition <- info$condition
+
+  cat("\n", basename(info$file), "before doublet removal:\n")
+  print(table(df$num_features))
+
+  df <- df[df$num_features == 1, ]   # remove doublets
+
+  cat(basename(info$file), "after doublet removal:\n")
+  print(table(df$num_features))
+
+  return(df)
+})
+
+combined <- do.call(rbind, all_samples)
+
+# Sanity checks
+table(combined$Condition)
+table(combined$Sex)
+
+combined %>%
+  group_by(sample, Condition) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  group_by(Condition) %>%
+  summarise(avg_cells = mean(n_cells), sd_cells = sd(n_cells), n_samples = n())
+
+combined %>%
+  group_by(sample, Sex) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  group_by(Sex) %>%
+  summarise(avg_cells = mean(n_cells), sd_cells = sd(n_cells), n_samples = n())
+
+# Add metadata to Seurat object
+seurat_object <- AddMetaData(seurat_object, combined$sample,    col.name = "Sample_ID")
+seurat_object <- AddMetaData(seurat_object, combined$Sex,       col.name = "Sex")
+seurat_object <- AddMetaData(seurat_object, combined$Condition, col.name = "Condition")
+
+
+# =============================================================================
+# 4. QC FILTERING
+# =============================================================================
+
+# --- 4a. Remove Y-chromosome genes to eliminate sex bias ---
+#"Y_genes.csv contains a list of all Y-linked genes and the X chromosome inactivation gene Xist
+y_genes_df  <- read.csv("Y_genes.csv", header = TRUE, stringsAsFactors = FALSE)
+y_genes     <- y_genes_df[["Gene.name"]]
+present_y   <- intersect(y_genes, rownames(seurat_object[["RNA"]]))
+
+message(length(present_y), " of ", length(y_genes),
+        " Y-chromosome genes found and will be removed: ",
+        paste(present_y, collapse = ", "))
+
+seurat_object[["RNA"]] <- subset(
+  seurat_object[["RNA"]],
+  features = setdiff(rownames(seurat_object[["RNA"]]), present_y)
+)
+
+# --- 4b. Mitochondrial content filter ---
+seurat_object$percent.mito <- PercentageFeatureSet(seurat_object, pattern = "^mt-")
+
+VlnPlot(seurat_object, features = "percent.mito")
+VlnPlot(seurat_object, features = "percent.mito", group.by = "Condition")
+
+# Check retention rates at various thresholds
+for (thresh in c(5, 10, 15, 20, 25, 30)) {
+  cat(sprintf("<%.0f%% mt: %.1f%% cells retained\n",
+              thresh, 100 * mean(seurat_object$percent.mito < thresh)))
+}
+
+seurat_object <- subset(seurat_object, subset = percent.mito < 5)
+VlnPlot(seurat_object, features = "percent.mito", group.by = "Condition")
+
+# Cell counts after mito filter
+cat("Cells remaining by Condition:\n"); print(table(seurat_object$Condition))
+cat("Cells remaining by Sex:\n");       print(table(seurat_object$Sex))
+cat("Cells remaining by Sample_ID:\n"); print(table(seurat_object$Sample_ID))
+cat("Total cells remaining:", ncol(seurat_object), "\n")
+
+saveRDS(seurat_object, "seurat_object.Rds")
+
+
+# =============================================================================
+# 5. DECONTX – AMBIENT RNA REMOVAL
+# =============================================================================
+
+# --- 5a. Quick clustering for DecontX input ---
+seurat_tmp <- NormalizeData(seurat_object)
+seurat_tmp <- FindVariableFeatures(seurat_tmp, nfeatures = 2000)
+seurat_tmp <- ScaleData(seurat_tmp)
+seurat_tmp <- RunPCA(seurat_tmp, verbose = FALSE)
+ElbowPlot(seurat_tmp)   # plateau ~PC12 -> use dims 1:12
+
+seurat_tmp <- FindNeighbors(seurat_tmp, dims = 1:12)
+
+for (res in seq(0.2, 2, by = 0.2)) {
+  seurat_tmp <- FindClusters(seurat_tmp, resolution = res, verbose = FALSE)
+}
+clustree(seurat_tmp, prefix = "RNA_snn_res.")
+seurat_tmp <- FindClusters(seurat_tmp, resolution = 0.2)   # coarse clusters for DecontX
+
+# --- 5b. Run DecontX ---
+sce                     <- as.SingleCellExperiment(seurat_object)
+sce$cluster_for_decontx <- as.character(Idents(seurat_tmp))
+sce                     <- decontX(sce, z = sce$cluster_for_decontx)
+saveRDS(sce, "sce.Rds")
+
+# --- 5c. Inspect haemoglobin contamination before / after DecontX ---
+haem_genes      <- c("Hbb-bt", "Hbb-bs", "Hbb-y", "Hba-a1", "Hbq1b", "Hba-a2", "Hbq1a")
+haem_genes      <- intersect(haem_genes, rownames(sce))   # keep only present genes
+contam_frac     <- colData(sce)$decontX_contamination
+corrected_counts <- decontXcounts(sce)
+
+haem_orig      <- colSums(counts(sce)[haem_genes, , drop = FALSE]) / colSums(counts(sce))
+haem_corrected <- colSums(corrected_counts[haem_genes, , drop = FALSE]) / colSums(corrected_counts)
+
+haem_df   <- data.frame(Cell = colnames(sce), Original = haem_orig, Corrected = haem_corrected)
+haem_melt <- melt(haem_df, id.vars = "Cell", variable.name = "Stage", value.name = "HaemFraction")
+
+ggplot(haem_melt, aes(x = HaemFraction, fill = Stage)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 50) +
+  scale_x_log10() +
+  theme_classic() +
+  labs(title = "Haemoglobin fraction per cell before and after DecontX",
+       x = "Haemoglobin fraction (log scale)", y = "Number of cells")
+
+# --- 5d. Remove highly contaminated cells (>30%) ---
+sce_filtered <- sce[, contam_frac < 0.3]
+
+cat("Original cells:", ncol(seurat_object), "\n")
+cat("Cells after DecontX filter:", ncol(sce_filtered), "\n")
+cat("Cells removed:", ncol(seurat_object) - ncol(sce_filtered), "\n")
+cat("Fraction retained:", ncol(sce_filtered) / ncol(seurat_object), "\n")
+
+# Subset Seurat object and replace counts with DecontX-corrected values
+seurat_object <- subset(seurat_object, cells = colnames(sce_filtered))
+seurat_object[["RNA"]] <- SetAssayData(
+  seurat_object[["RNA"]],
+  layer    = "counts",
+  new.data = decontXcounts(sce_filtered)
+)
+
+saveRDS(seurat_object, "seurat_object.Rds")
+
+
+# =============================================================================
+# 6. BLOOD CONTAMINATION REMOVAL
+# =============================================================================
+
+blood_genes_mouse <- c(
+  "Hba-a1", "Hba-a2", "Hbb-bs", "Hbb-bt", "Hbb-b1", "Hbb-b2",
+  "Lyz2", "S100a8", "S100a9", "C1qa", "C1qb", "C1qc",
+  "Pf4", "Ppbp", "Ptprc", "Cd14", "Csf1r", "Mpo"
+)
+blood_genes_present <- intersect(blood_genes_mouse, rownames(seurat_object[["RNA"]]))
+
+if (length(blood_genes_present) == 0) {
+  stop("No blood marker genes found. Check gene naming (case sensitivity).")
+}
+
+# Module score for blood gene expression
+seurat_object <- AddModuleScore(seurat_object, features = list(blood_genes_present), name = "Blood")
+VlnPlot(seurat_object, features = "Blood1", group.by = "Condition")
+
+# Correlate each gene with blood score (Spearman)
+expr       <- GetAssayData(seurat_object, slot = "data")
+blood_score <- seurat_object$Blood1
+
+cor_vals <- apply(expr, 1, function(x)
+  cor(x, blood_score, method = "spearman", use = "pairwise.complete.obs"))
+
+cor_p <- sapply(rownames(expr), function(g) {
+  x <- expr[g, ]
+  if (sd(x) == 0) return(NA)
+  cor.test(x, blood_score, method = "spearman")$p.value
+})
+
+cor_df <- data.frame(
+  gene = rownames(expr),
+  rho  = cor_vals,
+  pval = cor_p,
+  padj = p.adjust(cor_p, "BH")
+)
+
+suspect_genes <- cor_df$gene[abs(cor_df$rho) > 0.75 & cor_df$padj < 0.05]
+cat("Suspect blood-correlated genes:", length(suspect_genes), "\n")
+
+# Remove blood-correlated genes from variable features
+VariableFeatures(seurat_object) <- setdiff(VariableFeatures(seurat_object), suspect_genes)
+
+# Remove blood genes from the dataset
+seurat_object <- subset(seurat_object,
+                         features = setdiff(rownames(seurat_object), blood_genes_mouse))
+
+
+# =============================================================================
+# 7. NORMALISATION, VARIABLE FEATURES, SCALING & PCA
+# =============================================================================
+
+seurat_object <- NormalizeData(seurat_object)
+seurat_object <- FindVariableFeatures(seurat_object, nfeatures = 2000)
+
+# Visualise top variable genes
+top20  <- head(VariableFeatures(seurat_object), 20)
+plot1  <- VariableFeaturePlot(seurat_object)
+plot2  <- LabelPoints(plot1, points = top20, repel = TRUE)
+print(plot2)
+
+# Filter lowly expressed genes (total counts >= 50)
+total_per_gene <- rowSums(GetAssayData(seurat_object, assay = "RNA", slot = "counts"))
+seurat_object  <- seurat_object[total_per_gene >= 50, ]
+
+seurat_object <- ScaleData(seurat_object)
+seurat_object <- RunPCA(seurat_object, features = VariableFeatures(seurat_object))
+
+# PCA diagnostics
+DimPlot(seurat_object, reduction = "pca")
+DimHeatmap(seurat_object, dims = 1:20, cells = 500, balanced = TRUE)
+ElbowPlot(seurat_object)   # plateau ~PC12 -> use dims 1:14
+
+seurat_object <- JackStraw(seurat_object, num.replicate = 100)
+seurat_object <- ScoreJackStraw(seurat_object, dims = 1:14)
+JackStrawPlot(seurat_object, dims = 1:14, reduction = "pca")
+
+saveRDS(seurat_object, "seurat_object.Rds")
+
+
+# =============================================================================
+# 8. HARMONY INTEGRATION, UMAP & CLUSTERING
+# =============================================================================
+
+# --- 8a. Check for batch effects before Harmony ---
+DimPlot(seurat_object, reduction = "umap", group.by = "Condition")
+DimPlot(seurat_object, reduction = "umap", group.by = "Sex")
+DimPlot(seurat_object, reduction = "umap", group.by = "Sample_ID")
+
+pca_embed <- Embeddings(seurat_object, "pca")[, 1:14]
+r2_per_pc  <- apply(pca_embed, 2, function(pc)
+  summary(lm(pc ~ seurat_object$Sample_ID))$adj.r.squared)
+print(r2_per_pc)   # consistently low R² -> minimal batch effect
+
+# --- 8b. Run Harmony ---
+seurat_object <- RunHarmony(
+  seurat_object,
+  group.by.vars = c("Condition", "Sex", "Sample_ID"),
+  reduction      = "pca",
+  reduction.save = "harmony"
+)
+
+DimPlot(seurat_object, reduction = "harmony", group.by = "Condition")
+DimPlot(seurat_object, reduction = "harmony", group.by = "Sex")
+
+# --- 8c. UMAP from Harmony embedding ---
+seurat_object <- RunUMAP(seurat_object, reduction = "harmony", dims = 1:14,
+                          reduction.name = "umap_harmony")
+
+# --- 8d. Cluster at multiple resolutions; choose via clustree ---
+seurat_object <- FindNeighbors(seurat_object, reduction = "harmony", dims = 1:14)
+
+for (res in seq(0.2, 2, by = 0.2)) {
+  seurat_object <- FindClusters(seurat_object, resolution = res, verbose = FALSE)
+}
+clustree(seurat_object, prefix = "RNA_snn_res.")
+ggsave("plots/RNA_snn_res.png", plot = last_plot())
+
+# Select resolution 0.4 based on clustree stability
+seurat_object <- FindClusters(seurat_object, resolution = 0.4)
+seurat_object$harmony_clusters <- seurat_object$seurat_clusters
+
+DimPlot(seurat_object, reduction = "umap_harmony", group.by = "harmony_clusters")
+
+# Cell counts per cluster
+print(table(seurat_object$seurat_clusters))
+
+# Cells per cluster per sample
+cells_by_sample <- as.data.frame(table(Idents(seurat_object), seurat_object$Sample_ID))
+write_csv(cells_by_sample, "cells_by_sample.csv")
+
+saveRDS(seurat_object, "seurat_object.Rds")
+
+
+# =============================================================================
+# 9. CLUSTER ANNOTATION
+# =============================================================================
+
+# Run FindAllMarkers to identify cluster marker genes
+Idents(seurat_object) <- seurat_object$harmony_clusters_subcl
+
+seurat_markers      <- FindAllMarkers(seurat_object, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat_markers_sig  <- subset(seurat_markers, p_val_adj < 0.05)
+
+write.csv(seurat_markers_sig, "seurat_objectClusterMarkers.csv")
+
+Top10genes  <- seurat_markers %>% group_by(cluster) %>% slice_max(n = 10,  order_by = avg_log2FC)
+Top50genes  <- seurat_markers %>% group_by(cluster) %>% slice_max(n = 50,  order_by = avg_log2FC)
+Top100genes <- seurat_markers %>% group_by(cluster) %>% slice_max(n = 100, order_by = avg_log2FC)
+
+write.csv(Top10genes,  "Top10avglog2FCgenes_per_cluster.csv")
+write.csv(Top50genes,  "Top50avglog2FCgenes_per_cluster.csv")
+write.csv(Top100genes, "Top100avglog2FCgenes_per_cluster.csv")
+
+# Print top genes per cluster to console
+for (cl in levels(seurat_object)) {
+  genes <- subset(Top50genes, cluster == cl)$gene
+  cat("Cluster", cl, "top genes:\n")
+  print(genes)
+  cat("\n")
+}
+
+# --- Cell type label mappings ---
+cluster_annotations_long <- c(
+  "0a" = "Homeostatic Microglia / brain-resident macrophage (activated/inflammatory-like)",
+  "0b" = "Activated microglia / inflammatory macrophages",
+  "1a" = "Radial glia",
+  "1b" = "Radial glia / early astroglial lineage",
+  "2a" = "CNS endothelial / blood-brain-barrier-like cells",
+  "2b" = "Immature astrocytes",
+  "3a" = "Excitatory projection neurons (likely cortical layer-specific)",
+  "3b" = "GABAergic interneurons (Dlx/Gad2+, migrating)",
+  "4"  = "Cajal-Retzius / Reln-expressing marginal zone neurons",
+  "5"  = "Oligodendrocyte precursor cells (OPCs)",
+  "6"  = "Erythroid / RBC contamination",
+  "7"  = "Border-associated macrophages / perivascular macrophages",
+  "8"  = "Glycinergic inhibitory neurons (likely hindbrain/cerebellar)",
+  "9"  = "Meningeal / stromal fibroblast-like cells",
+  "10" = "Proliferating/mitotic progenitors",
+  "11" = "Proliferating neural progenitors",
+  "12" = "Glutamatergic excitatory neurons (Slc17a6/VGLUT2+)",
+  "13" = "Interneuron progenitors / migrating interneurons (Dlx1/2)",
+  "14" = "Myeloid / infiltrating granulocyte-like cells",
+  "15" = "Erythroid / RBC contamination",
+  "16" = "Meningeal / mesenchymal fibroblast-like cells",
+  "17" = "B lymphocytes (Ig genes, Cd79a, Ms4a1)",
+  "18" = "Choroid plexus epithelial / ependymal-like cells",
+  "19" = "Brain endothelial / BBB transporter-rich cells"
+)
+
+cluster_annotations_short <- c(
+  "0a" = "Homeostatic microglia",         "0b" = "Activated microglia",
+  "1a" = "Radial glia",                   "1b" = "Radial glia early astrocyte lineage",
+  "2a" = "Brain endothelial cells",       "2b" = "Immature astrocytes",
+  "3a" = "Excitatory projection neurons", "3b" = "GABAergic interneurons",
+  "4"  = "Cajal-Retzius neurons",         "5"  = "Oligodendrocyte precursor cells",
+  "6"  = "Erythroid cells",               "7"  = "Border-associated macrophages",
+  "8"  = "Glycinergic inhibitory neurons","9"  = "Meningeal fibroblast-like cells",
+  "10" = "Proliferating progenitors",     "11" = "Proliferating neural progenitors",
+  "12" = "Glutamatergic excitatory neurons","13" = "Interneuron progenitors",
+  "14" = "Myeloid inflammatory cells",    "15" = "Erythroid cells",
+  "16" = "Meningeal mesenchymal cells",   "17" = "B lymphocytes",
+  "18" = "Choroid plexus epithelial cells","19" = "Brain endothelial transporter-rich cells"
+)
+
+Idents(seurat_object) <- seurat_object$harmony_clusters_subcl
+
+seurat_object$celltype_short <- plyr::mapvalues(
+  x    = as.character(Idents(seurat_object)),
+  from = names(cluster_annotations_short),
+  to   = as.vector(cluster_annotations_short)
+)
+
+seurat_object$celltype_long <- plyr::mapvalues(
+  x    = as.character(Idents(seurat_object)),
+  from = names(cluster_annotations_long),
+  to   = as.vector(cluster_annotations_long)
+)
+
+# --- Annotated UMAP plot ---
+cluster_colors <- c(
+  "0a" = "#F8766D", "0b" = "#EE8043", "1a" = "#E18A00", "1b" = "#D19300",
+  "2a" = "#BE9C00", "2b" = "#A8A400", "3a" = "#EB69F0", "3b" = "#68B100",
+  "4"  = "#D575FE", "5"  = "#00BB49", "6"  = "#00BE70", "7"  = "#00C090",
+  "8"  = "#00C1AB", "9"  = "#00BFC4", "10" = "#00BBDA", "11" = "#00B5ED",
+  "12" = "#00ACFC", "13" = "#42A0FF", "14" = "#8B93FF", "15" = "#B684FF",
+  "16" = "#24B700", "17" = "#8CAB00", "18" = "#F962DD", "19" = "#FF61C6"
+)
+names(cluster_colors) <- levels(seurat_object$celltype_short)
+
+umap_coords <- as.data.frame(Embeddings(seurat_object, "umap_harmony"))
+colnames(umap_coords) <- c("Dim1", "Dim2")
+umap_coords$short <- seurat_object$celltype_short
+
+centroids <- umap_coords %>%
+  group_by(short) %>%
+  summarise(Dim1 = mean(Dim1), Dim2 = mean(Dim2), .groups = "drop")
+
+p_umap <- DimPlot(
+  seurat_object, reduction = "umap_harmony",
+  group.by = "celltype_long", cols = cluster_colors,
+  label = FALSE, repel = TRUE
+) +
+  geom_text_repel(
+    data = centroids,
+    aes(x = Dim1, y = Dim2, label = short),
+    color = "black", size = 4, fontface = "bold",
+    box.padding = 1, max.overlaps = Inf
+  ) +
+  ggtitle("UMAP – Annotated Cell Clusters") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        legend.title = element_blank(),
+        legend.text  = element_text(size = 7),
+        legend.position = "none")
+
+print(p_umap)
+
+saveRDS(seurat_object, "seurat_object.Rds")
+
+
+# =============================================================================
+# 10. DIFFERENTIAL EXPRESSION
+# =============================================================================
+
+# ---- Helper: pseudobulk balance check ----------------------------------------
+check_pseudobulk_balance <- function(seurat_object,
+                                      cluster_col   = "celltype_short",
+                                      sample_col    = "Sample_ID",
+                                      condition_col = "Condition",
+                                      min_samples   = 2) {
+  meta <- seurat_object@meta.data
+
+  summary_df <- meta %>%
+    group_by(!!sym(cluster_col), !!sym(sample_col), !!sym(condition_col)) %>%
+    summarise(cell_count = n(), .groups = "drop") %>%
+    group_by(!!sym(cluster_col), !!sym(condition_col)) %>%
+    summarise(n_samples   = n_distinct(!!sym(sample_col)),
+              total_cells = sum(cell_count), .groups = "drop") %>%
+    pivot_wider(names_from  = !!sym(condition_col),
+                values_from = c(n_samples, total_cells),
+                values_fill = 0)
+
+  conds <- unique(meta[[condition_col]])
+  col1  <- paste0("n_samples_", conds[1])
+  col2  <- paste0("n_samples_", conds[2])
+
+  summary_df <- summary_df %>%
+    mutate(eligible_for_DE = !!sym(col1) >= min_samples & !!sym(col2) >= min_samples)
+
+  return(summary_df)
+}
+
+cluster_check <- check_pseudobulk_balance(seurat_object)
+View(cluster_check)
+
+# ---- 10a. Per-cluster FindMarkers (WT vs Mut) ---------------------------------
+output_dir_fm <- "#<OUTPUT DIRECTORY PATH>/Clusters"
+
+Idents(seurat_object) <- seurat_object$harmony_clusters_subcl
+
+for (cluster in levels(seurat_object)) {
+  seurat_cluster <- seurat_object[, seurat_object@active.ident == cluster]
+
+  celltypes <- unique(seurat_cluster$celltype_short)
+  celltype  <- if (length(celltypes) > 1) {
+    warning("Cluster ", cluster, " has multiple cell types: ", paste(celltypes, collapse = ", "))
+    paste(celltypes, collapse = "_")
+  } else {
+    celltypes
+  }
+
+  Idents(seurat_cluster) <- seurat_cluster$Condition
+  de_result <- FindMarkers(
+    seurat_cluster,
+    ident.1            = "WT",
+    ident.2            = "Mut",
+    logfc.threshold    = 0.25,
+    min.cells.feature  = 3,
+    min.cells.group    = 3,
+    min.pct            = 0,
+    only.pos           = FALSE
+  )
+
+  de_result$AveExpr <- rowMeans(
+    GetAssayData(seurat_cluster, assay = "RNA", layer = "data")[rownames(de_result), ]
+  )
+
+  significant <- de_result[!is.na(de_result$p_val_adj) & de_result$p_val_adj < 0.05, ]
+
+  if (nrow(significant) == 0) {
+    message("No significant DEGs for cluster ", cluster, " (", celltype, "), skipping.")
+    next
+  }
+
+  celltype_safe <- gsub("[^A-Za-z0-9_\\-]", "_", celltype)
+  write.csv(significant,
+            file.path(output_dir_fm, paste0(cluster, "-", celltype_safe, ".csv")),
+            row.names = TRUE)
+  message("Saved FindMarkers DEGs: cluster ", cluster, " (", celltype, ")")
+}
+
+# ---- 10b. Pseudobulk DESeq2 --------------------------------------------------
+output_dir_pb <- "#<OUTPUT DIRECTORY PATH>/PseudobulkClusters"
+if (!dir.exists(output_dir_pb)) dir.create(output_dir_pb, recursive = TRUE)
+
+cluster_col   <- "celltype_short"
+condition_col <- "Condition"
+sample_col    <- "Sample_ID"
+exclude_clusters <- c("7", "9", "12", "14", "15", "16")
+
+clusters <- setdiff(unique(as.character(seurat_object[[cluster_col]][, 1])), exclude_clusters)
+message("Running pseudobulk DESeq2 for clusters: ", paste(clusters, collapse = ", "))
+
+for (cluster in clusters) {
+  message("Processing cluster ", cluster, " ...")
+
+  seu_cluster <- subset(seurat_object, subset = !!as.name(cluster_col) == cluster)
+  meta        <- seu_cluster@meta.data
+  counts      <- GetAssayData(seu_cluster, assay = "RNA", slot = "counts")
+
+  # Pseudobulk by sample
+  pb_counts <- t(rowsum(t(as.matrix(counts)), group = meta[[sample_col]]))
+
+  sample_info_sub <- meta %>%
+    distinct(!!sym(sample_col), .keep_all = TRUE) %>%
+    select(all_of(c(sample_col, condition_col)))
+
+  # Match column names
+  colnames(pb_counts)       <- make.names(colnames(pb_counts))
+  rownames(sample_info_sub) <- make.names(sample_info_sub[[sample_col]])
+  sample_info_sub           <- sample_info_sub[colnames(pb_counts), , drop = FALSE]
+
+  if (length(unique(sample_info_sub[[condition_col]])) < 2) {
+    message("Skipping cluster ", cluster, ": only one condition present.")
+    next
+  }
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = pb_counts,
+    colData   = sample_info_sub,
+    design    = as.formula(paste0("~", condition_col))
+  )
+  dds <- dds[rowSums(counts(dds)) >= 10, ]
+  dds[[condition_col]] <- relevel(dds[[condition_col]], ref = "WT")
+  dds <- DESeq(dds)
+
+  res        <- as.data.frame(results(dds, contrast = c(condition_col, "Mut", "WT")))
+  res        <- res[order(res$pvalue), ]
+  res$gene   <- rownames(res)
+  res$mean_norm_counts <- rowMeans(counts(dds, normalized = TRUE))
+
+  cluster_clean <- gsub("[^A-Za-z0-9_\\-]", "_", cluster)
+  write.csv(res,
+            file.path(output_dir_pb, paste0("Cluster_", cluster_clean, "_DESeq2_all.csv")),
+            row.names = FALSE)
+
+  sig <- subset(res, padj < 0.05)
+  if (nrow(sig) > 0) {
+    write.csv(sig,
+              file.path(output_dir_pb, paste0("Cluster_", cluster_clean, "_DESeq2_FDR0.05.csv")),
+              row.names = FALSE)
+    message("Finished cluster ", cluster, " — total: ", nrow(res), ", significant: ", nrow(sig))
+  } else {
+    message("No significant DEGs for cluster ", cluster)
+  }
+}
+
+# ---- 10c. Global DEGs (all cells, WT vs Mut) ---------------------------------
+Idents(seurat_object) <- seurat_object$Condition
+
+ALL_DEGs <- FindMarkers(
+  seurat_object,
+  ident.1           = "Mut",
+  ident.2           = "WT",
+  logfc.threshold   = 0.25,
+  min.cells.feature = 3,
+  min.cells.group   = 3,
+  min.pct           = 0,
+  only.pos          = FALSE
+)
+significant_global <- subset(ALL_DEGs, p_val_adj < 0.05)
+write.csv(significant_global, "ALL_DEGs.csv")
+
+
+# =============================================================================
+# 11. PATHWAY ENRICHMENT (GO, KEGG, Hallmark MSigDB)
+# =============================================================================
+
+deg_path      <- "#<OUTPUT DIRECTORY PATH>/pseudobulk"
+padj_cutoff   <- 0.05
+logfc_cutoff  <- 0.05
+
+# Helper: map Ensembl IDs to gene symbols if needed
+map_to_symbol <- function(ids) {
+  mapped <- bitr(ids, fromType = "ENSEMBL", toType = "SYMBOL", OrgDb = org.Mm.eg.db)
+  unique(mapped$SYMBOL)
+}
+
+# Hallmark gene sets (MSigDB)
+msig_hallmark <- msigdbr(species = "Mus musculus", category = "H")
+
+results_hallmark <- list()
+results_GO       <- list()
+results_KEGG     <- list()
+
+for (file in list.files(deg_path, full.names = TRUE)) {
+
+  cluster_name <- tools::file_path_sans_ext(basename(file))
+  deg          <- read.csv(file)
+
+  # Map Ensembl -> symbol if necessary
+  is_ensembl <- all(grepl("ENSMUSG", head(deg$gene, 5)))
+  sig_genes <- deg %>%
+    filter(padj < padj_cutoff & abs(log2FoldChange) > logfc_cutoff) %>%
+    pull(gene)
+
+  if (is_ensembl) sig_genes <- map_to_symbol(sig_genes)
+
+  if (length(sig_genes) == 0) {
+    message("No DEGs passed thresholds for cluster ", cluster_name)
+    next
+  }
+
+  # Hallmark ORA
+  enr_h <- tryCatch(
+    enricher(sig_genes,
+             TERM2GENE    = msig_hallmark %>% dplyr::select(gs_name, gene_symbol),
+             pvalueCutoff = 0.05),
+    error = function(e) NULL
+  )
+  if (!is.null(enr_h)) {
+    df <- enr_h@result; df$cluster <- cluster_name
+    results_hallmark[[cluster_name]] <- df
+  }
+
+  # GO Biological Process
+  enr_go <- tryCatch(
+    enrichGO(gene         = sig_genes,
+             OrgDb        = org.Mm.eg.db,
+             keyType      = "SYMBOL",
+             ont          = "BP",
+             pAdjustMethod = "BH",
+             pvalueCutoff = 0.05),
+    error = function(e) NULL
+  )
+  if (!is.null(enr_go)) {
+    df <- enr_go@result; df$cluster <- cluster_name
+    results_GO[[cluster_name]] <- df
+  }
+
+  # KEGG
+  enr_kegg <- tryCatch(
+    enrichKEGG(gene         = sig_genes,
+               organism     = "mmu",
+               keyType      = "kegg",
+               pvalueCutoff = 0.05),
+    error = function(e) NULL
+  )
+  if (!is.null(enr_kegg)) {
+    df <- enr_kegg@result; df$cluster <- cluster_name
+    results_KEGG[[cluster_name]] <- df
+  }
+}
+
+# Save combined results
+write.csv(bind_rows(results_hallmark), "Hallmark_enrichment_all_clusters.csv", row.names = FALSE)
+write.csv(bind_rows(results_GO),       "GO_BP_enrichment_all_clusters.csv",    row.names = FALSE)
+write.csv(bind_rows(results_KEGG),     "KEGG_enrichment_all_clusters.csv",     row.names = FALSE)
+
+message("Pathway enrichment complete. Results saved.")
